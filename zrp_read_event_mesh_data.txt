@@ -1,0 +1,189 @@
+*&---------------------------------------------------------------------*
+*& Report ZRP_READ_EVENT_MESH_DATA
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT zrp_read_event_mesh_data.
+
+*******************************************************************************************
+*                 Variable Declaratin Section                                             *
+*******************************************************************************************
+DATA: lo_oa2c_client TYPE REF TO if_oauth2_client.
+DATA(lv_dest_name) = 'EVENT_MESH_DEMO'.
+DATA(lv_auth_profile) = 'EVENT_MESH_DEMO_PROFILE'.
+
+******************************************************************************************
+*           Instantiate HTTP Client using rfc destination name                           *
+******************************************************************************************
+
+**  Create RFC connect
+cl_http_client=>create_by_destination(
+                              EXPORTING  destination = lv_dest_name
+                              IMPORTING  client                   = DATA(lo_http_client)
+                              EXCEPTIONS argument_not_found       = 1
+                                         destination_not_found    = 2
+                                         destination_no_authority = 3
+                                         plugin_not_active        = 4
+                                         internal_error           = 5
+                                         OTHERS                   = 6 ).
+lo_http_client->propertytype_logon_popup = if_http_client=>co_disabled.
+IF sy-subrc <> 0.
+* Raise error and exception handling in case of instation of http_client failed
+ENDIF.
+
+*****************************************************************************************
+*           Set Authentication token (oAuth token) to the connection                    *
+*****************************************************************************************
+
+**  Set token for authorization OAuth 2.0
+TRY.
+    cl_oauth2_client=>create( EXPORTING i_profile        = CONV #( lv_auth_profile )
+                              RECEIVING ro_oauth2_client = lo_oa2c_client ).
+  CATCH cx_oa2c.
+* Raise error and exception handling in case of client creation failed for OAuth profile
+ENDTRY.
+
+TRY.
+    lo_oa2c_client->set_token( EXPORTING io_http_client = lo_http_client ).
+
+  CATCH cx_oa2c.
+    TRY.
+        CALL METHOD lo_oa2c_client->execute_cc_flow.
+      CATCH cx_oa2c.
+* Raise error and exception handling in case of token set is failed
+    ENDTRY.
+
+    TRY.
+        lo_oa2c_client->set_token( EXPORTING io_http_client = lo_http_client ).
+      CATCH cx_oa2c.
+* Raise error and exception handling in case of token set is failed
+    ENDTRY.
+ENDTRY.
+
+DATA(lt_request_headers) = VALUE tihttpnvp( ( name  = /apeu/if_constants=>gc_http_req_header-qos
+                                              value = /apeu/if_constants=>gc_http_req_hdr_values-value_1 ) ).
+
+***********************************************************************
+*      Setting up of Request Parameters to Remote call                *
+***********************************************************************
+
+** Set URI
+cl_http_utility=>set_request_uri( EXPORTING  request = lo_http_client->request
+                                             uri     = '/messagingrest/v1/queues/demoqueue/messages/consumption' ).
+
+** Set request headers for the call if passed
+LOOP AT lt_request_headers ASSIGNING FIELD-SYMBOL(<ls_headers>).
+  lo_http_client->request->set_header_field( EXPORTING  name  = <ls_headers>-name
+                                                        value = <ls_headers>-value ).
+ENDLOOP.
+
+lo_http_client->refresh_cookie( ).
+
+** Set Request Method (GET/POST/PATCH)
+lo_http_client->request->set_method( method = 'POST' ).
+
+***********************************************************************
+*                     Trigger the communication                       *
+***********************************************************************
+
+** Send the call
+lo_http_client->send( EXCEPTIONS  http_communication_failure = 1
+                                  http_invalid_state = 2
+                                  http_processing_failed = 3
+                                  http_invalid_timeout  = 4 ).
+IF sy-subrc <> 0.
+* Raise error and exception handling if call is failed
+ENDIF.
+
+********Fire Recieve call to fetch response from (http_client)
+
+lo_http_client->receive( EXCEPTIONS http_communication_failure = 1
+                                    http_invalid_state         = 2
+                                    http_processing_failed     = 3 ).
+
+IF sy-subrc <> 0.
+* Raise error and exception handling if response is not received
+ENDIF.
+
+DATA: lt_headers TYPE tihttpnvp.
+
+**** Fetch Response Headers
+CALL METHOD lo_http_client->response->get_header_fields( CHANGING fields = lt_headers ).
+
+lo_http_client->response->get_status( IMPORTING code = DATA(lv_code) ).
+
+IF lv_code = 404 OR lv_code = 400 OR lv_code = 204.
+  CLEAR lv_code.
+* Raise error and exception handling
+ENDIF.
+
+**** Fetch response Payload
+DATA(lv_payload) = lo_http_client->response->get_cdata( ).
+DATA: lr_data TYPE REF TO data.
+
+**   Deserialize payload into a deep structure
+/ui2/cl_json=>deserialize( EXPORTING json             =  lv_payload                             " JSON string
+                                     pretty_name      =  /ui2/cl_json=>pretty_mode-camel_case   " Pretty Print property names
+                                     assoc_arrays     =  abap_true                              " Deserialize associative array as tables with unique keys
+                                     conversion_exits =  abap_true                              " Use DDIC conversion continues on deserialize of values
+                           CHANGING  data             =  lr_data    ).                          " Data to serialize
+
+TRY .
+    DATA(lv_msg_id) =  lt_headers[ name = /apeu/if_constants=>gc_http_req_header-msg_id ]-value.
+  CATCH cx_sy_itab_line_not_found.
+* Raise error and exception handling
+ENDTRY.
+
+******************************************************************************************
+* Step 5: Parse Payload fetched from Event Mesh            *                             *
+******************************************************************************************
+*   TODO: Write parsing payload based on requirement
+
+
+******************************************************************************************
+* Send akcnowledgement to EM and delete message from queue                       *
+******************************************************************************************
+
+CONCATENATE '/messagingrest/v1/queues/demoqueue/messages/' lv_msg_id '/acknowledgement' INTO DATA(lv_acknowledgement_uri).
+
+** Set URI
+cl_http_utility=>set_request_uri( EXPORTING  request = lo_http_client->request
+                                             uri     = lv_acknowledgement_uri ).
+lo_http_client->refresh_cookie( ).
+
+** Set Request Method (GET/POST/PATCH)
+lo_http_client->request->set_method( method = 'POST' ).
+
+***********************************************************************
+*                     Trigger the communication                       *
+***********************************************************************
+** Send the call
+lo_http_client->send( EXCEPTIONS  http_communication_failure = 1
+                                  http_invalid_state = 2
+                                  http_processing_failed = 3
+                                  http_invalid_timeout  = 4 ).
+IF sy-subrc <> 0.
+* Raise error and exception handling if call is failed
+ENDIF.
+
+********Fire Recieve call to fetch response from (http_client)
+lo_http_client->receive( EXCEPTIONS http_communication_failure = 1
+                                    http_invalid_state         = 2
+                                    http_processing_failed     = 3 ).
+
+IF sy-subrc <> 0.
+* Raise error and exception handling if response is not received
+ENDIF.
+
+CLEAR: lv_code.
+lo_http_client->response->get_status( IMPORTING code = lv_code ).
+
+**  Add log
+IF lv_code = 202.
+*   Success call once acknowledgement is done
+ENDIF.
+
+**  Close connection
+IF lo_http_client IS NOT INITIAL.
+  lo_http_client->close( ).
+ENDIF.
